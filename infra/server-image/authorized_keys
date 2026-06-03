@@ -1,0 +1,2 @@
+# Placeholder — Terraform overwrites this with the generated SSH public key
+# (see terraform/main.tf, resource local_file.authorized_keys) before building.

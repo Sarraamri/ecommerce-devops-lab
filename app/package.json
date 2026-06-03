@@ -1,0 +1,14 @@
+{
+  "name": "ecommerce-devops-lab-app",
+  "version": "1.0.0",
+  "description": "Tiny e-commerce demo app (Node.js + Express + MongoDB) for the IaaS DevOps lab",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node seed.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.8.0"
+  }
+}

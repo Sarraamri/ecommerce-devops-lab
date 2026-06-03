@@ -1,0 +1,138 @@
+name: Full DevOps Pipeline (AWS / Learner Lab)
+
+# Runs on GitHub's servers against your AWS Academy Learner Lab.
+# NOTE: Learner Lab credentials are TEMPORARY. Each time you click
+# "Start Lab", re-copy AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+# AWS_SESSION_TOKEN into the repo secrets, or this pipeline will fail
+# with an auth/expired-token error.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}   # enables the manual "Destroy" job
+
+jobs:
+  # =====================================================================
+  # 1. TERRAFORM INFRASTRUCTURE
+  # =====================================================================
+  terraform:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      private_ips: ${{ steps.export.outputs.private_ips }}
+      bastion_ip:  ${{ steps.export.outputs.bastion_ip }}
+      alb_dns:     ${{ steps.export.outputs.alb_dns }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      - name: Export Outputs
+        id: export
+        run: |
+          PRIV=$(terraform output -json instance_private_ips | jq -r '.[]' | tr '\n' ',')
+          echo "private_ips=$PRIV" >> "$GITHUB_OUTPUT"
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+
+  # =====================================================================
+  # 2. ANSIBLE CONFIGURATION (through the bastion)
+  # =====================================================================
+  ansible:
+    name: Configure Servers
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible jq
+
+      - name: Setup SSH Key (vockey)
+        working-directory: ansible
+        run: |
+          echo "${{ secrets.EC2_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      - name: Generate Inventory (private IPs via bastion ProxyJump)
+        working-directory: ansible
+        run: |
+          BASTION="${{ needs.terraform.outputs.bastion_ip }}"
+          echo "[web]" > inventory.generated.ini
+          for ip in $(echo "${{ needs.terraform.outputs.private_ips }}" | tr ',' ' '); do
+            [ -z "$ip" ] && continue
+            echo "$ip ansible_user=ec2-user" >> inventory.generated.ini
+          done
+          echo "" >> inventory.generated.ini
+          echo "[web:vars]" >> inventory.generated.ini
+          echo "ansible_ssh_private_key_file=key.pem" >> inventory.generated.ini
+          echo "ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"ssh -W %h:%p -i key.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@${BASTION}\"'" >> inventory.generated.ini
+          echo "----- inventory.generated.ini -----"
+          cat inventory.generated.ini
+
+      - name: Wait for instances to finish booting
+        run: sleep 60
+
+      - name: Run Ansible Deployment
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: ansible-playbook -i inventory.generated.ini deploy.yml
+
+      - name: Print ALB URL
+        run: echo "App should be live at http://${{ needs.terraform.outputs.alb_dns }}"
+
+  # =====================================================================
+  # 3. OPTIONAL: TERRAFORM DESTROY (manual run only)
+  # =====================================================================
+  destroy:
+    name: Destroy Infrastructure (Manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
